@@ -7,8 +7,65 @@ import pandas as pd
 from datetime import datetime
 import json
 from dotenv import load_dotenv
+import logging
+from logging.handlers import RotatingFileHandler
 
 load_dotenv()
+
+# 配置日志系统
+def setup_logger():
+    """配置日志系统，同时输出到文件和控制台"""
+    # 创建 logs 目录
+    log_dir = 'logs'
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    # 日志文件路径
+    log_file = os.path.join(log_dir, f'trading_bot_{datetime.now().strftime("%Y%m%d")}.log')
+    
+    # 创建 logger
+    logger = logging.getLogger('TradingBot')
+    logger.setLevel(logging.DEBUG)
+    
+    # 避免重复添加 handler
+    if logger.handlers:
+        logger.handlers.clear()
+    
+    # 创建文件处理器（带日志轮转，单个文件最大 10MB，保留 5 个备份）
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.DEBUG)
+    
+    # 创建控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    
+    # 创建格式化器
+    detailed_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    simple_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # 设置格式化器
+    file_handler.setFormatter(detailed_formatter)
+    console_handler.setFormatter(simple_formatter)
+    
+    # 添加处理器到 logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+# 初始化日志
+logger = setup_logger()
 
 # 初始化DeepSeek客户端
 deepseek_client = OpenAI(
@@ -25,9 +82,9 @@ exchange = ccxt.binance({
 # 交易参数配置
 TRADE_CONFIG = {
     'symbol': 'BTC/USDT',
-    'amount': 0.001,  # 交易数量 (BTC)
+    'amount': 0.002,  # 交易数量 (BTC)
     'leverage': 10,  # 杠杆倍数
-    'timeframe': '15m',  # 使用1小时K线，可改为15m
+    'timeframe': '15m',  # 使用15分钟K线
     'test_mode': False,  # 测试模式
 }
 
@@ -40,23 +97,49 @@ position = None
 def setup_exchange():
     """设置交易所参数"""
     try:
-        # 设置杠杆
+        # 1. 检查并设置持仓模式为单向持仓
+        logger.info("检查持仓模式...")
+        try:
+            # 获取当前持仓模式
+            position_mode_response = exchange.fapiPrivateGetPositionSideDual()
+            dual_side = position_mode_response.get('dualSidePosition', False)
+            
+            if dual_side:
+                logger.warning("当前为双向持仓模式，尝试切换为单向持仓模式...")
+                logger.warning("注意：切换前请确保账户无持仓和挂单！")
+                
+                # 尝试切换为单向持仓模式
+                try:
+                    exchange.fapiPrivatePostPositionSideDual({'dualSidePosition': 'false'})
+                    logger.info("✓ 已成功切换为单向持仓模式")
+                except Exception as e:
+                    logger.error(f"✗ 切换持仓模式失败: {e}")
+                    logger.error("请手动在币安网页端切换为单向持仓模式后重启程序")
+                    return False
+            else:
+                logger.info("✓ 当前已是单向持仓模式")
+                
+        except Exception as e:
+            logger.warning(f"无法检测持仓模式: {e}")
+            logger.warning("假设为单向持仓模式继续运行")
+        
+        # 2. 设置杠杆
         exchange.set_leverage(TRADE_CONFIG['leverage'], TRADE_CONFIG['symbol'])
-        print(f"设置杠杆倍数: {TRADE_CONFIG['leverage']}x")
+        logger.info(f"✓ 设置杠杆倍数: {TRADE_CONFIG['leverage']}x")
 
-        # 获取余额
+        # 3. 获取余额
         balance = exchange.fetch_balance()
         usdt_balance = balance['USDT']['free']
-        print(f"当前USDT余额: {usdt_balance:.2f}")
+        logger.info(f"✓ 当前USDT余额: {usdt_balance:.2f}")
 
         return True
     except Exception as e:
-        print(f"交易所设置失败: {e}")
+        logger.error(f"交易所设置失败: {e}", exc_info=True)
         return False
 
 
 def get_btc_ohlcv():
-    """获取BTC/USDT的K线数据（1小时或15分钟）"""
+    """获取BTC/USDT的K线数据"""
     try:
         # 获取最近10根K线
         ohlcv = exchange.fetch_ohlcv(TRADE_CONFIG['symbol'], TRADE_CONFIG['timeframe'], limit=10)
@@ -79,7 +162,7 @@ def get_btc_ohlcv():
             'kline_data': df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].tail(5).to_dict('records')
         }
     except Exception as e:
-        print(f"获取K线数据失败: {e}")
+        logger.error(f"获取K线数据失败: {e}", exc_info=True)
         return None
 
 
@@ -107,7 +190,7 @@ def get_current_position():
                     else:
                         position_amt = contracts
 
-                print(f"调试 - 持仓量: {position_amt}")
+                logger.debug(f"持仓量: {position_amt}")
 
                 if position_amt != 0:  # 有持仓
                     side = 'long' if position_amt > 0 else 'short'
@@ -120,13 +203,11 @@ def get_current_position():
                         'symbol': pos['symbol']  # 返回实际的symbol用于调试
                     }
 
-        print("调试 - 未找到有效持仓")
+        logger.debug("未找到有效持仓")
         return None
 
     except Exception as e:
-        print(f"获取持仓失败: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"获取持仓失败: {e}", exc_info=True)
         return None
 
 
@@ -219,8 +300,11 @@ def analyze_with_deepseek(price_data):
             json_str = result[start_idx:end_idx]
             signal_data = json.loads(json_str)
         else:
-            print(f"无法解析JSON: {result}")
+            logger.warning(f"无法解析JSON: {result}")
             return None
+
+        logger.info(f"promp={prompt}")
+        logger.info(f"signal={signal_data}")
 
         # 保存信号到历史记录
         signal_data['timestamp'] = price_data['timestamp']
@@ -231,7 +315,7 @@ def analyze_with_deepseek(price_data):
         return signal_data
 
     except Exception as e:
-        print(f"DeepSeek分析失败: {e}")
+        logger.error(f"DeepSeek分析失败: {e}", exc_info=True)
         return None
 
 
@@ -239,13 +323,13 @@ def execute_trade(signal_data, price_data):
     """执行交易（简化版）"""
     current_position = get_current_position()
 
-    print(f"交易信号: {signal_data['signal']}")
-    print(f"信心程度: {signal_data['confidence']}")
-    print(f"理由: {signal_data['reason']}")
-    print(f"当前持仓: {current_position}")
+    logger.info(f"交易信号: {signal_data['signal']}")
+    logger.info(f"信心程度: {signal_data['confidence']}")
+    logger.info(f"理由: {signal_data['reason']}")
+    logger.info(f"当前持仓: {current_position}")
 
     if TRADE_CONFIG['test_mode']:
-        print("测试模式 - 仅模拟交易")
+        logger.warning("测试模式 - 仅模拟交易")
         return
 
     try:
@@ -253,7 +337,7 @@ def execute_trade(signal_data, price_data):
         if signal_data['signal'] == 'BUY':
             if current_position and current_position['side'] == 'short':
                 # 平空仓
-                print("平空仓...")
+                logger.info("平空仓...")
                 exchange.create_market_buy_order(
                     TRADE_CONFIG['symbol'],
                     current_position['size'],
@@ -261,7 +345,7 @@ def execute_trade(signal_data, price_data):
                 )
             elif not current_position or current_position['side'] == 'long':
                 # 开多仓或加多仓
-                print("开多仓...")
+                logger.info("开多仓...")
                 exchange.create_market_buy_order(
                     TRADE_CONFIG['symbol'],
                     TRADE_CONFIG['amount'],
@@ -271,7 +355,7 @@ def execute_trade(signal_data, price_data):
         elif signal_data['signal'] == 'SELL':
             if current_position and current_position['side'] == 'long':
                 # 平多仓
-                print("平多仓...")
+                logger.info("平多仓...")
                 exchange.create_market_sell_order(
                     TRADE_CONFIG['symbol'],
                     current_position['size'],
@@ -279,7 +363,7 @@ def execute_trade(signal_data, price_data):
                 )
             elif not current_position or current_position['side'] == 'short':
                 # 开空仓或加空仓
-                print("开空仓...")
+                logger.info("开空仓...")
                 exchange.create_market_sell_order(
                     TRADE_CONFIG['symbol'],
                     TRADE_CONFIG['amount'],
@@ -287,33 +371,32 @@ def execute_trade(signal_data, price_data):
                 )
 
         elif signal_data['signal'] == 'HOLD':
-            print("建议观望，不执行交易")
+            logger.info("建议观望，不执行交易")
             return
 
-        print("订单执行成功")
+        logger.info("订单执行成功")
+        # 更新持仓信息
         time.sleep(2)
         position = get_current_position()
-        print(f"更新后持仓: {position}")
+        logger.info(f"更新后持仓: {position}")
 
     except Exception as e:
-        print(f"订单执行失败: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"订单执行失败: {e}", exc_info=True)
 
 def trading_bot():
     """主交易机器人函数"""
-    print("\n" + "=" * 60)
-    print(f"执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info(f"执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("=" * 60)
 
     # 1. 获取K线数据
     price_data = get_btc_ohlcv()
     if not price_data:
         return
 
-    print(f"BTC当前价格: ${price_data['price']:,.2f}")
-    print(f"数据周期: {TRADE_CONFIG['timeframe']}")
-    print(f"价格变化: {price_data['price_change']:+.2f}%")
+    logger.info(f"BTC当前价格: ${price_data['price']:,.2f}")
+    logger.info(f"数据周期: {TRADE_CONFIG['timeframe']}")
+    logger.info(f"价格变化: {price_data['price_change']:+.2f}%")
 
     # 2. 使用DeepSeek分析
     signal_data = analyze_with_deepseek(price_data)
@@ -326,35 +409,37 @@ def trading_bot():
 
 def main():
     """主函数"""
-    print("BTC/USDT 自动交易机器人启动成功！")
+    logger.info("=" * 60)
+    logger.info("BTC/USDT 自动交易机器人启动成功！")
 
     if TRADE_CONFIG['test_mode']:
-        print("当前为模拟模式，不会真实下单")
+        logger.warning("当前为模拟模式，不会真实下单")
     else:
-        print("实盘交易模式，请谨慎操作！")
+        logger.warning("实盘交易模式，请谨慎操作！")
 
-    print(f"交易周期: {TRADE_CONFIG['timeframe']}")
-    print("已启用K线数据分析和持仓跟踪功能")
+    logger.info(f"交易周期: {TRADE_CONFIG['timeframe']}")
+    logger.info("已启用K线数据分析和持仓跟踪功能")
 
     # 设置交易所
     if not setup_exchange():
-        print("交易所初始化失败，程序退出")
+        logger.critical("交易所初始化失败，程序退出")
         return
 
     # 根据时间周期设置执行频率
     if TRADE_CONFIG['timeframe'] == '1h':
         # 每小时执行一次，在整点后的1分钟执行
         schedule.every().hour.at(":01").do(trading_bot)
-        print("执行频率: 每小时一次")
+        logger.info("执行频率: 每小时一次")
     elif TRADE_CONFIG['timeframe'] == '15m':
         # 每15分钟执行一次
         schedule.every(15).minutes.do(trading_bot)
-        print("执行频率: 每15分钟一次")
+        logger.info("执行频率: 每15分钟一次")
     else:
         # 默认1小时
         schedule.every().hour.at(":01").do(trading_bot)
-        print("执行频率: 每小时一次")
+        logger.info("执行频率: 每小时一次")
 
+    logger.info("=" * 60)
     # 立即执行一次
     trading_bot()
 
